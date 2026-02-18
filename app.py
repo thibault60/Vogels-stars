@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import json
 from serpapi import GoogleSearch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
@@ -17,15 +18,12 @@ except Exception:
 
 VP_DOMAIN = "voyage-prive.com"
 
-# ────────────────────────────────────────────────────
-# 2. Requêtes de test prédéfinies
-# ────────────────────────────────────────────────────
 DEFAULT_QUERIES = """voyage en Thaïlande
 séjour tout compris pas cher
 hôtel bord de mer"""
 
 # ────────────────────────────────────────────────────
-# 3. Sidebar
+# 2. Sidebar
 # ────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Paramètres")
@@ -35,6 +33,9 @@ with st.sidebar:
     max_workers = st.slider("Threads simultanés", 1, 8, 3)
 
     st.markdown("---")
+    debug_mode = st.toggle("🐛 Mode debug", value=False, help="Affiche la structure brute SerpApi pour identifier les clés du carrousel")
+
+    st.markdown("---")
     st.markdown(
         "**Sources extraites**\n\n"
         "- 🔵 Lien bleu principal (résultat organique VP)\n"
@@ -42,7 +43,7 @@ with st.sidebar:
     )
 
 # ────────────────────────────────────────────────────
-# 4. Zone de saisie des requêtes
+# 3. Zone de saisie des requêtes
 # ────────────────────────────────────────────────────
 st.title("🔍 Visibilité Voyage Privé – Liens organiques & Sitelinks")
 st.markdown(
@@ -60,15 +61,11 @@ queries = [q.strip() for q in queries_raw.splitlines() if q.strip()]
 st.caption(f"**{len(queries)} requête(s)** chargée(s)")
 
 # ────────────────────────────────────────────────────
-# 5. Extraction SerpApi
+# 4. Fonctions d'extraction
 # ────────────────────────────────────────────────────
 
-def extract_vp_results(query: str, hl: str, gl: str, num: int) -> list[dict]:
-    """
-    Extrait depuis SerpApi :
-    - Le résultat organique principal VP (lien bleu)
-    - Les sitelinks inline VP (carrousel d'offres sous le résultat)
-    """
+def fetch_raw(query: str, hl: str, gl: str, num: int) -> dict:
+    """Retourne la réponse brute SerpApi."""
     params = {
         "q": query,
         "api_key": SERPAPI_KEY,
@@ -77,12 +74,20 @@ def extract_vp_results(query: str, hl: str, gl: str, num: int) -> list[dict]:
         "num": num,
         "engine": "google",
     }
+    search = GoogleSearch(params)
+    return search.get_dict()
 
+
+def extract_vp_results(query: str, hl: str, gl: str, num: int) -> tuple[list[dict], dict]:
+    """
+    Retourne (rows, raw_data).
+    rows = liste de dicts pour le tableau résultats
+    raw_data = réponse brute SerpApi (pour le mode debug)
+    """
     try:
-        search = GoogleSearch(params)
-        data = search.get_dict()
+        data = fetch_raw(query, hl, gl, num)
     except Exception as exc:
-        return [_row(query, "⚠️ Erreur API", "—", str(exc), "", "—")]
+        return [_row(query, "⚠️ Erreur API", "—", str(exc), "", "—")], {}
 
     rows = []
     organic = data.get("organic_results", [])
@@ -90,7 +95,6 @@ def extract_vp_results(query: str, hl: str, gl: str, num: int) -> list[dict]:
     for pos, result in enumerate(organic, start=1):
         main_link = result.get("link", "")
 
-        # ── 🔵 Lien bleu principal ────────────────────
         if VP_DOMAIN in main_link:
             rows.append(_row(
                 query   = query,
@@ -101,20 +105,22 @@ def extract_vp_results(query: str, hl: str, gl: str, num: int) -> list[dict]:
                 snippet = result.get("snippet", "—"),
             ))
 
-            # ── 🎠 Sitelinks inline (carrousel offres) ─
-            # SerpApi retourne les sitelinks dans organic_results[n]["sitelinks"]
-            # sous la clé "inline" (liste de dicts avec "title" et "link")
+            # Tentative sur toutes les structures connues de sitelinks
             sitelinks_data = result.get("sitelinks", {})
 
             if isinstance(sitelinks_data, dict):
-                inline_links = sitelinks_data.get("inline", [])
+                inline_links = (
+                    sitelinks_data.get("inline", [])
+                    or sitelinks_data.get("expanded", [])
+                    or sitelinks_data.get("list", [])
+                )
             elif isinstance(sitelinks_data, list):
                 inline_links = sitelinks_data
             else:
                 inline_links = []
 
             for idx, sl in enumerate(inline_links, start=1):
-                sl_link = sl.get("link", "")
+                sl_link = sl.get("link", "") or sl.get("url", "")
                 if VP_DOMAIN in sl_link:
                     rows.append(_row(
                         query   = query,
@@ -128,7 +134,7 @@ def extract_vp_results(query: str, hl: str, gl: str, num: int) -> list[dict]:
     if not rows:
         rows.append(_row(query, "❌ Absent", "—", "Voyage Privé absent des résultats", "", ""))
 
-    return rows
+    return rows, data
 
 
 def _row(query, type_, position, titre, url, snippet) -> dict:
@@ -143,8 +149,9 @@ def _row(query, type_, position, titre, url, snippet) -> dict:
 
 
 @st.cache_data(ttl=3_600, show_spinner=False)
-def run_all(queries_tuple: tuple, hl: str, gl: str, num: int, workers: int) -> pd.DataFrame:
-    rows = []
+def run_all(queries_tuple: tuple, hl: str, gl: str, num: int, workers: int) -> tuple[pd.DataFrame, dict]:
+    all_rows = []
+    all_raw  = {}  # {query: raw_data}
     progress = st.progress(0.0, text="🔄 Analyse des SERP…")
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -153,22 +160,24 @@ def run_all(queries_tuple: tuple, hl: str, gl: str, num: int, workers: int) -> p
         }
         total = len(futures)
         for i, future in enumerate(as_completed(futures), 1):
-            rows.extend(future.result())
+            rows, raw = future.result()
+            all_rows.extend(rows)
+            q = futures[future]
+            all_raw[q] = raw
             progress.progress(i / total, text=f"🔄 {i}/{total} requêtes analysées…")
     progress.empty()
-    return pd.DataFrame(rows)
+    return pd.DataFrame(all_rows), all_raw
 
 
 # ────────────────────────────────────────────────────
-# 6. Lancement + Affichage
+# 5. Lancement + Affichage
 # ────────────────────────────────────────────────────
 
 if st.button("🚀 Lancer l'extraction", type="primary", disabled=len(queries) == 0):
 
-    df = run_all(tuple(queries), hl, gl, num_results, max_workers)
+    df, raw_data = run_all(tuple(queries), hl, gl, num_results, max_workers)
 
     # ── KPIs ─────────────────────────────────────────
-    present   = df[~df["Type"].isin(["❌ Absent", "⚠️ Erreur API"])]
     principal = df[df["Type"] == "🔵 Lien principal"]
     sitelinks = df[df["Type"] == "🎠 Sitelink carrousel"]
     absent    = df[df["Type"] == "❌ Absent"]
@@ -206,10 +215,10 @@ if st.button("🚀 Lancer l'extraction", type="primary", disabled=len(queries) =
     st.subheader("🔍 Détail par requête")
 
     for query in df["Requête"].unique():
-        subset  = df[df["Requête"] == query]
-        nb_sl   = len(subset[subset["Type"] == "🎠 Sitelink carrousel"])
-        has_main= len(subset[subset["Type"] == "🔵 Lien principal"]) > 0
-        has_vp  = has_main or nb_sl > 0
+        subset   = df[df["Requête"] == query]
+        nb_sl    = len(subset[subset["Type"] == "🎠 Sitelink carrousel"])
+        has_main = len(subset[subset["Type"] == "🔵 Lien principal"]) > 0
+        has_vp   = has_main or nb_sl > 0
 
         badge_main = "🔵 lien principal" if has_main else ""
         badge_sl   = f"+ 🎠 {nb_sl} sitelink(s)" if nb_sl else ""
@@ -218,27 +227,53 @@ if st.button("🚀 Lancer l'extraction", type="primary", disabled=len(queries) =
         with st.expander(label):
             if not has_vp:
                 st.info("Voyage Privé n'apparaît pas dans les résultats analysés.")
-                continue
+            else:
+                main_rows = subset[subset["Type"] == "🔵 Lien principal"]
+                if not main_rows.empty:
+                    r = main_rows.iloc[0]
+                    st.markdown(f"**🔵 Résultat principal — Position `{r['Position']}`**")
+                    st.markdown(f"**{r['Titre']}**")
+                    st.markdown(f"[{r['URL']}]({r['URL']})")
+                    if r["Snippet"] and r["Snippet"] not in ("—", ""):
+                        st.caption(r["Snippet"])
+                    st.markdown("---")
 
-            # Lien principal
-            main_rows = subset[subset["Type"] == "🔵 Lien principal"]
-            if not main_rows.empty:
-                r = main_rows.iloc[0]
-                st.markdown(f"**🔵 Résultat principal — Position `{r['Position']}`**")
-                st.markdown(f"**{r['Titre']}**")
-                st.markdown(f"[{r['URL']}]({r['URL']})")
-                if r["Snippet"] and r["Snippet"] not in ("—", ""):
-                    st.caption(r["Snippet"])
+                sl_rows = subset[subset["Type"] == "🎠 Sitelink carrousel"]
+                if not sl_rows.empty:
+                    st.markdown(f"**🎠 Sitelinks carrousel — {len(sl_rows)} offre(s)**")
+                    for _, r in sl_rows.iterrows():
+                        col_a, col_b = st.columns([2, 8])
+                        col_a.markdown(f"Pos. `{r['Position']}`")
+                        col_b.markdown(f"**{r['Titre']}** → [{r['URL']}]({r['URL']})")
+
+            # ── 🐛 MODE DEBUG ─────────────────────────
+            if debug_mode and query in raw_data:
                 st.markdown("---")
+                st.markdown("**🐛 Structure brute SerpApi — résultats VP uniquement**")
 
-            # Sitelinks carrousel
-            sl_rows = subset[subset["Type"] == "🎠 Sitelink carrousel"]
-            if not sl_rows.empty:
-                st.markdown(f"**🎠 Sitelinks carrousel — {len(sl_rows)} offre(s)**")
-                for _, r in sl_rows.iterrows():
-                    col_a, col_b = st.columns([3, 7])
-                    col_a.markdown(f"Position `{r['Position']}`")
-                    col_b.markdown(f"**{r['Titre']}** → [{r['URL']}]({r['URL']})")
+                vp_results = [
+                    r for r in raw_data[query].get("organic_results", [])
+                    if VP_DOMAIN in r.get("link", "")
+                ]
+
+                if vp_results:
+                    for r in vp_results:
+                        st.markdown(f"**Position {r.get('position')} — Clés disponibles :**")
+                        # Affiche toutes les clés avec leur type et valeur tronquée
+                        keys_info = {
+                            k: f"{type(v).__name__} → {str(v)[:150]}"
+                            for k, v in r.items()
+                        }
+                        st.json(keys_info)
+
+                        # Focus sur sitelinks si présents
+                        if "sitelinks" in r:
+                            st.markdown("**🎯 Clé `sitelinks` (structure complète) :**")
+                            st.json(r["sitelinks"])
+                        else:
+                            st.warning("⚠️ Pas de clé `sitelinks` dans ce résultat — le carrousel n'est pas parsé par SerpApi pour cette requête.")
+                else:
+                    st.info("Aucun résultat VP dans la réponse brute.")
 
     # ── Exports ──────────────────────────────────────
     st.markdown("---")
